@@ -14,7 +14,6 @@ use crate::network::{Connection};
 use crate::OsInputOutput;
 
 use std::net::{SocketAddr};
-use crate::os::macos::lsof_utils::RawConnection;
 use super::lsof_utils;
 
 struct KeyboardEvents;
@@ -51,7 +50,11 @@ fn get_open_sockets() -> HashMap<Connection, String> {
     let connections = lsof_utils::get_raw_connections_output();
 
     for raw_str in connections.lines() {
-        let raw_connection = RawConnection::new(raw_str).unwrap();
+        let raw_connection_option = lsof_utils::RawConnection::new(raw_str);
+        if raw_connection_option.is_none() {
+            continue;
+        }
+        let raw_connection = raw_connection_option.unwrap();
 
         let protocol = raw_connection.get_protocol();
         let ip_address = raw_connection.get_ip_address();
