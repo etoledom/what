@@ -8,15 +8,13 @@ use ::termion::input::TermRead;
 use ::std::collections::HashMap;
 use ::std::net::IpAddr;
 
-use std::process::Command;
-use regex::{Regex};
-
 use signal_hook::iterator::Signals;
 
-use crate::network::{Connection, Protocol};
+use crate::network::{Connection};
 use crate::OsInputOutput;
 
 use std::net::{SocketAddr};
+use crate::os::macos::lsof_utils::RawConnection;
 
 struct KeyboardEvents;
 
@@ -46,52 +44,93 @@ fn get_interface(interface_name: &str) -> Option<NetworkInterface> {
         .find(|iface| iface.name == interface_name)
 }
 
-#[derive(Debug)]
-struct RawConnection {
-    ip: String,
-    local_port: String,
-    remote_port: String,
-    protocol: String,
-    process_name: String,
+mod lsof_utils {
+    use std::process::{Command};
+    use std::ffi::OsStr;
+    use regex::{Regex};
+    use crate::network::Protocol;
+    use std::net::IpAddr;
+
+    #[derive(Debug, Clone)]
+    pub struct RawConnection {
+        ip: String,
+        local_port: String,
+        remote_port: String,
+        protocol: String,
+        pub process_name: String,
+    }
+
+    impl RawConnection {
+        pub fn new(raw_line: &str) -> Option<RawConnection> {
+            let CONNECTIONS_REGEX: Regex = Regex::new(r"([^\s]+).*(TCP|UDP).*:(.*)->(.*):(\d*)(\s|$)").unwrap();
+
+            let raw_connection_iter = CONNECTIONS_REGEX.captures_iter(raw_line).filter_map(|cap| {
+                let process_name = String::from(cap.get(1).unwrap().as_str());
+                let protocol = String::from(cap.get(2).unwrap().as_str());
+                let local_port = String::from(cap.get(3).unwrap().as_str());
+                let ip = String::from(cap.get(4).unwrap().as_str());
+                let remote_port = String::from(cap.get(5).unwrap().as_str());
+                let connection = RawConnection { process_name, ip, local_port, remote_port, protocol };
+                Some(connection)
+            });
+            let raw_connection_vec = raw_connection_iter.map(|m| m).collect::<Vec<_>>();
+            if raw_connection_vec.is_empty() {
+                None
+            } else {
+                Some(raw_connection_vec[0].clone())
+            }
+        }
+
+        pub fn get_protocol(&self) -> Protocol {
+            return Protocol::from_string(&self.protocol).unwrap();
+        }
+
+        pub fn get_ip_address(&self) -> IpAddr {
+            return IpAddr::V4(self.ip.parse().unwrap());
+        }
+
+        pub fn get_remote_port(&self) -> u16 {
+            return self.remote_port.parse::<u16>().unwrap();
+        }
+
+        pub fn get_local_port(&self) -> u16 {
+            return self.local_port.parse::<u16>().unwrap();
+        }
+    }
+
+    pub fn get_raw_connections_output<'a>() -> String {
+        return run(&["-n","-P", "-i4"]);
+    }
+
+    fn run<'a, I, S>(args: I) -> String
+        where I: IntoIterator<Item=S>, S: AsRef<OsStr>
+    {
+        let output = Command::new("lsof")
+            .args(args)
+            .output()
+            .expect("failed to execute process");
+
+        String::from_utf8(output.stdout).unwrap()
+    }
 }
 
 fn get_open_sockets() -> HashMap<Connection, String> {
     let mut open_sockets = HashMap::new();
 
-    let output = Command::new("lsof")
-            .args(&["-n","-P", "-i4"])//"4tcp"
-            .output()
-            .expect("failed to execute process");
+    let connections = lsof_utils::get_raw_connections_output();
 
-    let regex = Regex::new(r"([^\s]+).*(TCP|UDP).*:(.*)->(.*):(\d*)(\s|$)").unwrap();
+    for raw_str in connections.lines() {
+        let raw_connection = RawConnection::new(raw_str).unwrap();
 
-    let output_string = String::from_utf8(output.stdout).unwrap();
-    let lines = output_string.lines();
+        let protocol = raw_connection.get_protocol();
+        let ip_address = raw_connection.get_ip_address();
+        let remote_port = raw_connection.get_remote_port();
+        let local_port = raw_connection.get_local_port();
 
-    for line in lines {
-        let raw_connection_iter = regex.captures_iter(line).filter_map(|cap| {
-            let process_name = String::from(cap.get(1).unwrap().as_str());
-            let protocol = String::from(cap.get(2).unwrap().as_str());
-            let local_port = String::from(cap.get(3).unwrap().as_str());
-            let ip = String::from(cap.get(4).unwrap().as_str());
-            let remote_port = String::from(cap.get(5).unwrap().as_str());
-            let connection = RawConnection{process_name, ip,local_port, remote_port, protocol};
-            Some(connection)
-        });
+        let socket_addr = SocketAddr::new(ip_address, remote_port);
+        let connection = Connection::new(socket_addr, local_port, protocol).unwrap();
 
-        let raw_connection_vec = raw_connection_iter.map(|m| m).collect::<Vec<_>>();
-
-        if let Some(raw_connection) = raw_connection_vec.first() {
-            let protocol = Protocol::from_string(&raw_connection.protocol).unwrap();
-            let ip_address = IpAddr::V4(raw_connection.ip.parse().unwrap());
-            let remote_port = raw_connection.remote_port.parse::<u16>().unwrap();
-            let local_port = raw_connection.local_port.parse::<u16>().unwrap();
-
-            let socket_addr = SocketAddr::new(ip_address, remote_port);
-            let connection = Connection::new(socket_addr, local_port, protocol).unwrap();
-
-            open_sockets.insert(connection, raw_connection.process_name.clone());
-        }
+        open_sockets.insert(connection, raw_connection.process_name.clone());
     }
 
     return open_sockets;
